@@ -28,3 +28,10 @@ curl -X POST http://localhost:3002/password/validate -H "Content-Type: applicati
 ```bash
 curl http://localhost:3002/protected/profile -H "x-user-id: alice"
 ```
+
+## CI e test su GitHub Actions
+
+- workflow `CI`: esegue `npm ci` + `npm test` su push e pull request
+- workflow `Manual Password Check`: avvio manuale da Actions con input `password`
+
+Se la password non rispetta la policy, il job fallisce mostrando il dettaglio della validazione.

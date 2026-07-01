@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { pathToFileURL } from "node:url";
 import Fastify from "fastify";
 import {
   IdentityPolicyEngine,
@@ -72,11 +73,10 @@ const engine = new IdentityPolicyEngine({
   },
 });
 
-const app = Fastify({ logger: false });
+export function createApp() {
+  const app = Fastify({ logger: false });
 
-app.addHook(
-  "preHandler",
-  createCodeSendExpiryHook({
+  const expiryHook = createCodeSendExpiryHook({
     getUserIdAndDateFn: async (req) => {
       const userId = String(req.headers["x-user-id"] ?? "").trim();
       if (!userId) {
@@ -93,88 +93,96 @@ app.addHook(
     },
     evaluatePasswordExpiryDecision: (passwordCreatedAt) =>
       engine.evaluatePasswordExpiryDecision(passwordCreatedAt),
-  }),
-);
+  });
 
-app.get("/", async () => ({
-  service: "gatekeeper-policies-fastify",
-  message: "Use /password/validate, /password/change and /protected/profile",
-  users: ["alice", "bob"],
-}));
-
-app.get("/demo/users", async () => {
-  return Array.from(users.entries()).map(([userId, data]) => ({
-    userId,
-    passwordCreatedAt: data.passwordCreatedAt.toISOString(),
-    historyCount: data.passwordHistory.length,
+  app.get("/", async () => ({
+    service: "gatekeeper-policies-fastify",
+    message: "Use /password/validate, /password/change and /protected/profile",
+    users: ["alice", "bob"],
   }));
-});
 
-app.post("/password/validate", async (req, reply) => {
-  const password = String(req.body?.password ?? "");
-  const complexity = engine.validateComplexity(password);
-  const code = complexity.isValid ? 200 : 400;
-  return reply.code(code).send(complexity);
-});
+  app.get("/demo/users", async () => {
+    return Array.from(users.entries()).map(([userId, data]) => ({
+      userId,
+      passwordCreatedAt: data.passwordCreatedAt.toISOString(),
+      historyCount: data.passwordHistory.length,
+    }));
+  });
 
-app.post("/password/change", async (req, reply) => {
-  const userId = String(req.body?.userId ?? "").trim();
-  const newPassword = String(req.body?.newPassword ?? "");
+  app.post("/password/validate", async (req, reply) => {
+    const password = String(req.body?.password ?? "");
+    const complexity = engine.validateComplexity(password);
+    const code = complexity.isValid ? 200 : 400;
+    return reply.code(code).send(complexity);
+  });
 
-  if (!userId || !newPassword) {
-    return reply.code(400).send({
-      code: "BAD_REQUEST",
-      message: "userId and newPassword are required.",
+  app.post("/password/change", async (req, reply) => {
+    const userId = String(req.body?.userId ?? "").trim();
+    const newPassword = String(req.body?.newPassword ?? "");
+
+    if (!userId || !newPassword) {
+      return reply.code(400).send({
+        code: "BAD_REQUEST",
+        message: "userId and newPassword are required.",
+      });
+    }
+
+    const complexity = engine.validateComplexity(newPassword);
+    if (!complexity.isValid) {
+      return reply.code(400).send({
+        code: "WEAK_PASSWORD",
+        details: complexity.errors,
+      });
+    }
+
+    const canRotate = await engine.validateRotation(
+      newPassword,
+      userId,
+      async (candidate, encrypted) => sha256(toUtf8String(candidate)) === encrypted,
+    );
+
+    if (!canRotate) {
+      return reply.code(409).send({
+        code: "PASSWORD_REUSED",
+        message: "Password was already used recently.",
+      });
+    }
+
+    await engine.getConfig().persistence.saveNewPassword(userId, sha256(newPassword));
+
+    return reply.code(200).send({
+      code: "PASSWORD_UPDATED",
+      userId,
     });
-  }
+  });
 
-  const complexity = engine.validateComplexity(newPassword);
-  if (!complexity.isValid) {
-    return reply.code(400).send({
-      code: "WEAK_PASSWORD",
-      details: complexity.errors,
-    });
-  }
-
-  const canRotate = await engine.validateRotation(
-    newPassword,
-    userId,
-    async (candidate, encrypted) => sha256(toUtf8String(candidate)) === encrypted,
+  app.get(
+    "/protected/profile",
+    { preHandler: expiryHook },
+    async (req) => {
+      const userId = String(req.headers["x-user-id"] ?? "unknown");
+      return {
+        userId,
+        profile: {
+          role: "demo-user",
+          data: "Access granted: password policy check passed.",
+        },
+      };
+    },
   );
 
-  if (!canRotate) {
-    return reply.code(409).send({
-      code: "PASSWORD_REUSED",
-      message: "Password was already used recently.",
+  app.setErrorHandler((error, _req, reply) => {
+    reply.code(400).send({
+      code: "BAD_REQUEST",
+      message: error instanceof Error ? error.message : "Unexpected error.",
     });
-  }
-
-  await engine.getConfig().persistence.saveNewPassword(userId, sha256(newPassword));
-
-  return reply.code(200).send({
-    code: "PASSWORD_UPDATED",
-    userId,
   });
-});
 
-app.get("/protected/profile", async (req) => {
-  const userId = String(req.headers["x-user-id"] ?? "unknown");
-  return {
-    userId,
-    profile: {
-      role: "demo-user",
-      data: "Access granted: password policy check passed.",
-    },
-  };
-});
+  return app;
+}
 
-app.setErrorHandler((error, _req, reply) => {
-  reply.code(400).send({
-    code: "BAD_REQUEST",
-    message: error instanceof Error ? error.message : "Unexpected error.",
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  createApp().listen({ port: PORT, host: "0.0.0.0" }).then(() => {
+    console.log(`Fastify playground running on http://localhost:${PORT}`);
   });
-});
-
-app.listen({ port: PORT, host: "0.0.0.0" }).then(() => {
-  console.log(`Fastify playground running on http://localhost:${PORT}`);
-});
+}
